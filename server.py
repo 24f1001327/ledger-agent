@@ -211,66 +211,29 @@ def read_cache():
     return None
 
 
+
 def load_orders(force=False):
-    """
-    Load the complete dataset.
+    """Load bundled order data; never fetch data during a question."""
+    local_file = Path(__file__).resolve().with_name("ledger_orders.json")
 
-    Order of preference:
-    1. In-memory cache
-    2. Disk cache
-    3. Fetch all source pages concurrently
-    """
-    now = time.time()
+    if not local_file.exists():
+        raise FileNotFoundError(
+            "ledger_orders.json is missing. Add it to the project root."
+        )
 
-    # Fastest path: data is already in process memory.
-    if (
-        not force
-        and _memory_cache["orders"] is not None
-        and now - _memory_cache["loaded_at"] < CACHE_MAX_AGE
-    ):
-        return _memory_cache["orders"]
+    with local_file.open("r", encoding="utf-8") as f:
+        orders = json.load(f)
 
-    # Second path: load previously downloaded data from disk.
-    if not force:
-        cached_orders = read_cache()
+    if not isinstance(orders, list) or not orders:
+        raise ValueError("ledger_orders.json contains no order records")
 
-        if cached_orders is not None:
-            _memory_cache["orders"] = cached_orders
-            _memory_cache["loaded_at"] = now
-            return cached_orders
-
-    # Cold start: fetch page 1 to discover total page count.
-    first_page = fetch_page(1)
-    orders = list(first_page["orders"])
-    total_pages = int(first_page.get("pages", 1))
-
-    # Fetch remaining pages concurrently instead of serially.
-    if total_pages > 1:
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {
-                executor.submit(fetch_page, page): page
-                for page in range(2, total_pages + 1)
-            }
-
-            for future in as_completed(futures):
-                page = futures[future]
-                payload = future.result()
-                orders.extend(payload["orders"])
-
-    # Only use the current version of each order.
     orders = deduplicate_orders(orders)
-
-    # Cache the completed dataset.
-    try:
-        save_cache(orders)
-    except OSError:
-        # Requests can still be served if disk caching fails.
-        pass
 
     _memory_cache["orders"] = orders
     _memory_cache["loaded_at"] = time.time()
 
     return orders
+
 
 
 # --------------------------------------------------
