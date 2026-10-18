@@ -393,6 +393,7 @@ def health():
 
 
 @app.post("/")
+@app.post("/answer")
 def ask(body: Question):
     try:
         orders, rates = load_data()
