@@ -1,53 +1,33 @@
 
 import json
-import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 app = FastAPI(title="Acme Appliances Ledger Agent")
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+DATA_FILE = Path(__file__).resolve().with_name("ledger_orders.json")
+TZ = ZoneInfo("Asia/Kolkata")
 
-BASE_URL = "https://exam.sanand.workers.dev/questionData"
-
-EMAIL = "24f1001327@ds.study.iitm.ac.in"
-
-QUIZ_SIGN = (
-    "HriBRlgVNhYASQleYhg5iU1ISEG9eru0RBJV6K5oJc1SqB3zUr1xfOa9Hq6M7wiCDfagphaEhlpMnfQuzPLzNNkDofDXWpZwTDjgoLjnOVry1fjdWKqFtEdlNBDPe9uVqlAPyL9uZMce/YmOXaHrMSpJRTNkLL6FJZiCHth0qLpKbsif096+FQE5+NWL9KXSZlUslGzW4dMIGL4Auk0ZYEaii7D+GpZztRlkFRaBBG7Maz5ML8boRNKd7ycIXQqVKs5N4HjH2uK4PZh7VqQr8Ylv/aIFAFcBXO77jdn8SaKx8409aRrEXG41Nx00U9nUVfd2ADORvErQD8QDhcXshA=="
-)
-
-QUESTION_ID = "q-ledger-agent-server"
-
-TIMEZONE = ZoneInfo("Asia/Kolkata")
-
-# USD value of one unit of each currency.
 USD_PER_UNIT = {
     "USD": Decimal("1"),
     "EUR": Decimal("1.05"),
     "INR": Decimal("0.01204"),
 }
 
-# Render's /tmp directory is suitable for a temporary cache.
-# The file may disappear when the service restarts.
-CACHE_FILE = Path("/tmp/acme_orders_cache.json")
-CACHE_MAX_AGE = 24 * 60 * 60
-
-# In-process cache avoids repeated disk reads and parsing.
-_memory_cache = {
-    "orders": None,
-    "loaded_at": 0.0,
+MONTHS = {
+    "january": 1, "february": 2, "march": 3,
+    "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
 }
+
+_cache = None
 
 
 class Question(BaseModel):
@@ -55,266 +35,182 @@ class Question(BaseModel):
 
 
 # --------------------------------------------------
-# API data loading
+# Load local data: no source API requests at runtime
 # --------------------------------------------------
 
-def fetch_page(page: int) -> dict:
-    """Fetch one page of orders from the source API."""
-    params = {
-        "email": EMAIL,
-        "quizSign": QUIZ_SIGN,
-        "questionId": QUESTION_ID,
-        "path": "/orders",
-        "page": page,
-    }
+def load_orders():
+    global _cache
 
-    response = requests.get(
-        BASE_URL,
-        params=params,
-        timeout=8,
-    )
-    response.raise_for_status()
+    if _cache is not None:
+        return _cache
 
-    payload = response.json()
-
-    if not isinstance(payload, dict):
-        raise ValueError(f"Unexpected response on page {page}")
-
-    if not isinstance(payload.get("orders"), list):
-        raise ValueError(
-            f"Expected an 'orders' list on page {page}"
+    if not DATA_FILE.exists():
+        raise FileNotFoundError(
+            f"{DATA_FILE.name} is missing. "
+            "Place it in the same folder as server.py."
         )
 
-    return payload
+    raw = DATA_FILE.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise ValueError("ledger_orders.json is empty")
+
+    # Accept either a JSON array or newline-delimited JSON records.
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            records = parsed
+        elif isinstance(parsed, dict) and isinstance(parsed.get("orders"), list):
+            records = parsed["orders"]
+        else:
+            records = [parsed]
+    except json.JSONDecodeError:
+        records = [
+            json.loads(line)
+            for line in raw.splitlines()
+            if line.strip()
+        ]
+
+    if not records:
+        raise ValueError("No order records were loaded")
+
+    # Keep only the latest version of each order ID.
+    latest = {}
+    for row in records:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+
+        order_id = str(row["id"])
+        old = latest.get(order_id)
+
+        if old is None:
+            latest[order_id] = row
+        elif parse_datetime(row.get("updated_at")) >= parse_datetime(
+            old.get("updated_at")
+        ):
+            latest[order_id] = row
+
+    _cache = list(latest.values())
+
+    if not _cache:
+        raise ValueError("No valid order records were found")
+
+    return _cache
 
 
 # --------------------------------------------------
-# Dates and currency
+# Data utilities
 # --------------------------------------------------
 
 def parse_datetime(value):
-    """Parse a timestamp and convert it to Asia/Kolkata."""
     if not value:
-        return datetime.min.replace(tzinfo=TIMEZONE)
+        return datetime.min.replace(tzinfo=TZ)
 
     try:
-        value = str(value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(value)
-
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TIMEZONE)
-
-        return dt.astimezone(TIMEZONE)
-
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
     except (ValueError, TypeError):
-        return datetime.min.replace(tzinfo=TIMEZONE)
+        return datetime.min.replace(tzinfo=TZ)
 
 
 def order_date(row):
-    """Return the order's creation date in the business timezone."""
     dt = parse_datetime(row.get("created_at"))
-
-    if dt.year == 1:
-        return None
-
-    return dt.date()
+    return None if dt.year == 1 else dt.date()
 
 
-def money(value):
-    """Round monetary values to two decimal places."""
-    result = Decimal(str(value)).quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP,
-    )
-    return float(result)
+def status_of(row):
+    return str(row.get("status", "")).strip().lower()
+
+
+def customer_of(row):
+    return str(row.get("customer", "")).strip()
+
+
+def product_of(row):
+    return str(row.get("product", "")).strip()
 
 
 def amount_usd(row):
-    """Convert the order amount into USD."""
     amount = Decimal(str(row.get("amount", 0)))
     currency = str(row.get("currency", "USD")).upper()
-
-    rate = USD_PER_UNIT.get(currency)
-
-    if rate is None:
-        raise ValueError(f"Unknown currency: {currency}")
-
-    return amount * rate
+    if currency not in USD_PER_UNIT:
+        raise ValueError(f"Unsupported currency: {currency}")
+    return amount * USD_PER_UNIT[currency]
 
 
-# --------------------------------------------------
-# Load, cache, and deduplicate orders
-# --------------------------------------------------
-
-def deduplicate_orders(orders):
-    """
-    An order ID can occur more than once.
-    Keep the row with the latest updated_at timestamp.
-    """
-    latest = {}
-
-    for row in orders:
-        order_id = str(row.get("id", ""))
-
-        if not order_id:
-            continue
-
-        previous = latest.get(order_id)
-
-        if previous is None:
-            latest[order_id] = row
-            continue
-
-        current_timestamp = parse_datetime(
-            row.get("updated_at")
+def rounded(value):
+    return float(
+        Decimal(str(value)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
         )
-        previous_timestamp = parse_datetime(
-            previous.get("updated_at")
+    )
+
+
+def is_paid(row):
+    return status_of(row) == "paid"
+
+
+def revenue_usd(rows):
+    return rounded(
+        sum(
+            (amount_usd(row) for row in rows if is_paid(row)),
+            Decimal("0"),
         )
-
-        if current_timestamp >= previous_timestamp:
-            latest[order_id] = row
-
-    return list(latest.values())
-
-
-def save_cache(orders):
-    """Write the cache atomically to avoid partial files."""
-    temporary_file = CACHE_FILE.with_suffix(".tmp")
-
-    with temporary_file.open("w", encoding="utf-8") as file:
-        json.dump(orders, file, separators=(",", ":"))
-
-    os.replace(temporary_file, CACHE_FILE)
-
-
-def read_cache():
-    """Return a fresh disk cache, or None if unavailable/stale."""
-    try:
-        if not CACHE_FILE.exists():
-            return None
-
-        age = time.time() - CACHE_FILE.stat().st_mtime
-
-        if age >= CACHE_MAX_AGE:
-            return None
-
-        with CACHE_FILE.open("r", encoding="utf-8") as file:
-            orders = json.load(file)
-
-        if isinstance(orders, list) and orders:
-            return orders
-
-    except (OSError, ValueError, TypeError):
-        pass
-
-    return None
-
-
-
-def load_orders(force=False):
-    """Load bundled order data; never fetch data during a question."""
-    local_file = Path(__file__).resolve().with_name("ledger_orders.json")
-
-    if not local_file.exists():
-        raise FileNotFoundError(
-            "ledger_orders.json is missing. Add it to the project root."
-        )
-
-    with local_file.open("r", encoding="utf-8") as f:
-        orders = json.load(f)
-
-    if not isinstance(orders, list) or not orders:
-        raise ValueError("ledger_orders.json contains no order records")
-
-    orders = deduplicate_orders(orders)
-
-    _memory_cache["orders"] = orders
-    _memory_cache["loaded_at"] = time.time()
-
-    return orders
-
+    )
 
 
 # --------------------------------------------------
-# Filtering and aggregation
+# Interpret filters in a question
 # --------------------------------------------------
-
-def product_name(row):
-    return str(row.get("product", "Unknown"))
-
-
-def customer_id(row):
-    return str(row.get("customer", "Unknown"))
-
 
 def filter_rows(rows, question):
-    """Filter orders using region, product, customer, and date."""
     q = question.lower()
-    selected = list(rows)
+    result = list(rows)
 
-    # Region filter.
-    regions = {
-        "north", "south", "east", "west", "central"
-    }
-
-    for region in regions:
+    # Region.
+    for region in ("north", "south", "east", "west", "central"):
         if re.search(rf"\b{region}\b", q):
-            selected = [
-                row for row in selected
+            result = [
+                row for row in result
                 if str(row.get("region", "")).lower() == region
             ]
             break
 
-    # Product filter: match the actual product spelling.
-    products = sorted(
-        {product_name(row) for row in rows},
+    # Product: match actual product names from the data.
+    # Longest names are checked first to avoid partial collisions.
+    available_products = sorted(
+        {product_of(row) for row in rows if product_of(row)},
         key=len,
         reverse=True,
     )
 
-    for product in products:
+    for product in available_products:
         if product.lower() in q:
-            selected = [
-                row for row in selected
-                if product_name(row) == product
+            result = [
+                row for row in result
+                if product_of(row).lower() == product.lower()
             ]
             break
 
-    # Customer filter.
-    customers = {customer_id(row) for row in rows}
-
-    for customer in customers:
-        if (
-            customer != "Unknown"
-            and customer.lower() in q
-        ):
-            selected = [
-                row for row in selected
-                if customer_id(row) == customer
-            ]
-            break
-
-    # Month and year filters.
-    months = {
-        "january": 1,
-        "february": 2,
-        "march": 3,
-        "april": 4,
-        "may": 5,
-        "june": 6,
-        "july": 7,
-        "august": 8,
-        "september": 9,
-        "october": 10,
-        "november": 11,
-        "december": 12,
+    # Customer ID, when named explicitly.
+    available_customers = {
+        customer_of(row) for row in rows if customer_of(row)
     }
 
+    for customer in available_customers:
+        if re.search(rf"\b{re.escape(customer.lower())}\b", q):
+            result = [
+                row for row in result
+                if customer_of(row) == customer
+            ]
+            break
+
+    # Month and year use the Asia/Kolkata business date.
     month = next(
         (
-            number
-            for name, number in months.items()
+            number for name, number in MONTHS.items()
             if re.search(rf"\b{name}\b", q)
         ),
         None,
@@ -324,84 +220,60 @@ def filter_rows(rows, question):
     year = int(year_match.group(1)) if year_match else None
 
     if month is not None or year is not None:
-        filtered = []
-
-        for row in selected:
+        dated = []
+        for row in result:
             dt = order_date(row)
-
             if dt is None:
                 continue
-
             if month is not None and dt.month != month:
                 continue
-
             if year is not None and dt.year != year:
                 continue
+            dated.append(row)
+        result = dated
 
-            filtered.append(row)
-
-        selected = filtered
-
-    # Explicit ISO dates, for example 2026-03-01.
-    iso_dates = re.findall(
-        r"\b(20\d{2}-\d{2}-\d{2})\b",
-        q,
-    )
-
+    # Explicit ISO dates, e.g. 2026-03-01.
+    iso_dates = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", q)
     if iso_dates:
-        parsed_dates = [
-            date.fromisoformat(value)
-            for value in iso_dates
-        ]
-
-        start_date = min(parsed_dates)
-        end_date = max(parsed_dates)
-
-        selected = [
-            row for row in selected
+        dates = [date.fromisoformat(value) for value in iso_dates]
+        start_date, end_date = min(dates), max(dates)
+        result = [
+            row for row in result
             if order_date(row) is not None
             and start_date <= order_date(row) <= end_date
         ]
 
-    return selected
+    return result
 
 
-def paid_orders(rows):
-    """Only paid orders count as revenue."""
-    return [
-        row for row in rows
-        if str(row.get("status", "")).lower() == "paid"
-    ]
+# --------------------------------------------------
+# Aggregations
+# --------------------------------------------------
+
+def unique_customer_count(rows):
+    return len({
+        customer_of(row)
+        for row in rows
+        if customer_of(row)
+    })
 
 
-def total_revenue_usd(rows):
-    return money(
-        sum(
-            (amount_usd(row) for row in paid_orders(rows)),
-            Decimal("0"),
-        )
-    )
-
-
-def aggregate(rows, key_function, metric):
+def grouped_total(rows, group_function, metric):
     totals = {}
 
     for row in rows:
-        key = key_function(row)
+        key = group_function(row)
 
         if metric == "revenue":
-            if str(row.get("status", "")).lower() != "paid":
+            if not is_paid(row):
                 continue
             value = amount_usd(row)
-
         elif metric == "quantity":
             value = Decimal(str(row.get("qty", 0)))
-
         elif metric == "orders":
             value = Decimal("1")
-
         else:
-            value = Decimal("0")
+            continue
 
         totals[key] = totals.get(key, Decimal("0")) + value
 
@@ -409,180 +281,141 @@ def aggregate(rows, key_function, metric):
 
 
 # --------------------------------------------------
-# Natural-language question answering
+# Question answering
 # --------------------------------------------------
 
-def answer_question(question, rows):
+def answer_question(question, all_orders):
     q = question.strip().lower()
-
     if not q:
         return "Please provide a question."
 
-    data = filter_rows(rows, q)
+    rows = filter_rows(all_orders, q)
 
-    # Refund-related questions.
-    if "refund" in q or "refunded" in q:
-        refunded = [
-            row for row in data
-            if str(row.get("status", "")).lower() == "refunded"
-        ]
-
-        if any(
-            phrase in q
-            for phrase in ("how many", "count", "number of")
-        ):
-            return len(refunded)
-
-        # The available order fields show order amounts, not
-        # necessarily the actual amount paid back to a customer.
-        return money(
-            sum(
-                (amount_usd(row) for row in refunded),
-                Decimal("0"),
-            )
-        )
-
-    # Revenue questions, including "earn", "earned", and "sales".
-    revenue_words = (
-        "revenue",
-        "sales",
-        "turnover",
-        "generated",
-        "earn",
-        "earned",
-        "how much did",
-        "how much was",
-        "how much in",
+    # IMPORTANT: handle distinct-customer questions FIRST.
+    # Filter paid status before counting unique customer IDs.
+    customer_count_question = (
+        ("customer" in q or "customers" in q)
+        and any(word in q for word in (
+            "how many", "count", "number of",
+            "different", "distinct", "at least one",
+        ))
     )
 
-    if any(word in q for word in revenue_words):
-        if any(
-            phrase in q
-            for phrase in (
-                "by product",
-                "per product",
-                "which product",
-                "top product",
-                "best-selling product",
-                "best selling product",
-            )
-        ):
-            totals = aggregate(data, product_name, "revenue")
+    if customer_count_question:
+        customer_rows = rows
+
+        # Explicit paid-only questions must exclude refunded and void rows.
+        if "paid" in q or "at least one paid" in q:
+            customer_rows = [
+                row for row in customer_rows if is_paid(row)
+            ]
+
+        return unique_customer_count(customer_rows)
+
+    # Refund counts / values.
+    if "refund" in q or "refunded" in q:
+        refunded = [row for row in rows if status_of(row) == "refunded"]
+
+        if any(word in q for word in ("how many", "count", "number of")):
+            return len(refunded)
+
+        return rounded(
+            sum((amount_usd(row) for row in refunded), Decimal("0"))
+        )
+
+    # Revenue questions: only current paid orders count.
+    revenue_question = any(word in q for word in (
+        "revenue", "sales", "turnover", "earned",
+        "earn", "generated", "how much did", "how much was",
+    ))
+
+    if revenue_question:
+        if any(phrase in q for phrase in (
+            "top product", "best-selling product",
+            "best selling product", "which product",
+            "by product", "per product",
+        )):
+            totals = grouped_total(rows, product_of, "revenue")
             return max(totals, key=totals.get) if totals else "No matching product"
 
-        if any(
-            phrase in q
-            for phrase in (
-                "by customer",
-                "per customer",
-                "which customer",
-                "top customer",
-            )
-        ):
-            totals = aggregate(data, customer_id, "revenue")
+        if any(phrase in q for phrase in (
+            "top customer", "which customer",
+            "by customer", "per customer",
+        )):
+            totals = grouped_total(rows, customer_of, "revenue")
             return max(totals, key=totals.get) if totals else "No matching customer"
 
-        return total_revenue_usd(data)
+        return revenue_usd(rows)
 
-    # Quantity and best-selling product questions.
-    if any(
-        phrase in q
-        for phrase in (
-            "most sold",
-            "best-selling",
-            "best selling",
-            "units sold",
-            "quantity sold",
-            "total quantity",
-        )
-    ):
-        totals = aggregate(data, product_name, "quantity")
+    # Most popular product / quantity questions.
+    if any(phrase in q for phrase in (
+        "most sold", "best-selling", "best selling",
+        "units sold", "quantity sold", "total quantity",
+        "highest quantity",
+    )):
+        totals = grouped_total(rows, product_of, "quantity")
 
-        if "how many" in q or "units sold" in q or "total quantity" in q:
+        if any(phrase in q for phrase in (
+            "units sold", "total quantity", "quantity sold",
+        )):
             return int(sum(totals.values()))
 
         return max(totals, key=totals.get) if totals else "No matching product"
 
-    # Customer-related questions.
-    if "customer" in q:
-        if any(
-            phrase in q
-            for phrase in ("how many", "count", "number of")
-        ):
-            return len({
-                customer_id(row)
-                for row in data
-                if customer_id(row) != "Unknown"
-            })
+    # Customer spend and customer order-ranking questions.
+    if "customer" in q or "customers" in q:
+        if any(phrase in q for phrase in (
+            "most orders", "placed the most", "most purchases",
+        )):
+            customer_rows = rows
+            if "paid" in q:
+                customer_rows = [
+                    row for row in customer_rows if is_paid(row)
+                ]
 
-        if any(
-            phrase in q
-            for phrase in (
-                "most orders",
-                "placed the most",
-                "most purchases",
-            )
-        ):
-            totals = aggregate(data, customer_id, "orders")
+            totals = grouped_total(customer_rows, customer_of, "orders")
             return max(totals, key=totals.get) if totals else "No matching customer"
 
-        if any(
-            phrase in q
-            for phrase in (
-                "spent",
-                "spend",
-                "purchase total",
-                "total purchases",
-            )
-        ):
-            return total_revenue_usd(data)
+        if any(phrase in q for phrase in (
+            "spent", "spend", "purchase total", "total purchases",
+        )):
+            return revenue_usd(rows)
 
-    # Order-count questions.
-    if any(
-        phrase in q
-        for phrase in (
-            "how many orders",
-            "number of orders",
-            "order count",
-            "count of orders",
-        )
-    ):
+    # Order counts.
+    order_count_question = any(phrase in q for phrase in (
+        "how many orders", "number of orders",
+        "order count", "count of orders",
+    ))
+
+    if order_count_question:
         if "paid" in q:
-            return len(paid_orders(data))
-
+            return sum(1 for row in rows if is_paid(row))
+        if "refunded" in q or "refund" in q:
+            return sum(1 for row in rows if status_of(row) == "refunded")
         if "void" in q:
-            return sum(
-                str(row.get("status", "")).lower() == "void"
-                for row in data
-            )
+            return sum(1 for row in rows if status_of(row) == "void")
+        return len(rows)
 
-        return len(data)
-
-    # Average paid order revenue.
-    if "average" in q and (
-        "order" in q or "revenue" in q
-    ):
-        paid = paid_orders(data)
-
-        if not paid:
+    # Average value of a paid order.
+    if "average" in q and ("order" in q or "revenue" in q):
+        paid_rows = [row for row in rows if is_paid(row)]
+        if not paid_rows:
             return 0.0
-
         total = sum(
-            (amount_usd(row) for row in paid),
+            (amount_usd(row) for row in paid_rows),
             Decimal("0"),
         )
+        return rounded(total / len(paid_rows))
 
-        return money(total / len(paid))
-
-    # Fallback for product questions.
+    # Fallback for product questions: return the product with most units.
     if "product" in q:
-        totals = aggregate(data, product_name, "quantity")
+        totals = grouped_total(rows, product_of, "quantity")
         return max(totals, key=totals.get) if totals else "No matching product"
 
     raise ValueError(
-        "Unable to interpret this question. "
-        "Supported topics include revenue, refunds, products, "
-        "customers, quantities, and order counts."
+        "Question type not supported. Supported categories include "
+        "paid revenue, refunds, distinct customers, product quantities, "
+        "and order counts."
     )
 
 
@@ -602,13 +435,8 @@ def health():
 @app.post("/answer")
 def ask(body: Question):
     try:
-        rows = load_orders()
-        answer = answer_question(body.question, rows)
-
-        return {"answer": answer}
-
+        orders = load_orders()
+        result = answer_question(body.question, orders)
+        return {"answer": result}
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
